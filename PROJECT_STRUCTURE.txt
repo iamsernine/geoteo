@@ -1,0 +1,31 @@
+.
+├── LICENSE
+├── PROJECT_STRUCTURE.txt
+├── README.md
+├── app.py
+├── assets
+│   └── custom.css
+├── backend
+│   ├── __init__.py
+│   ├── api_client.py
+│   ├── cache_manager.py
+│   ├── data_processor.py
+│   ├── ml_predictor.py
+│   └── report_generator.py
+├── config.py
+├── data
+│   └── cache
+│       └── cache.db
+├── exports
+├── frontend
+├── logs
+│   ├── airwatch.log
+│   ├── api_calls.log
+│   └── errors.log
+├── pyproject.toml
+├── run.sh
+└── utils
+    ├── __init__.py
+    └── logger_setup.py
+
+8 directories, 20 files
