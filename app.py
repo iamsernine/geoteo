@@ -25,6 +25,7 @@ from backend.weather_client import WeatherAPIClient
 from backend.ml_predictor import AirQualityPredictor
 from backend.report_generator import ReportGenerator
 from backend.database import Database
+from backend.openai_client import OpenAIClient
 import config
 
 # Configure logging
@@ -33,13 +34,15 @@ logger.add(sys.stderr, level=config.LOG_LEVEL)
 logger.add(config.LOG_FILE, rotation="10 MB", retention="7 days", level=config.LOG_LEVEL)
 
 # Initialize backend
-api_client = OpenAQClient()
+db = Database()
+api_client = OpenAQClient(db=db)  # Pass db to check for stored API keys
 data_processor = DataProcessor()
 cache_manager = CacheManager()
 weather_client = WeatherAPIClient()
 ml_predictor = AirQualityPredictor()
 report_gen = ReportGenerator()
-db = Database()
+# Initialize OpenAI client - will check .env (config) first, then database
+openai_client = OpenAIClient(db=db)
 
 # Initialize Dash app
 app = dash.Dash(
@@ -287,7 +290,8 @@ app.layout = html.Div([
                         dbc.Row([
                             dbc.Col([
                                 html.H2(id="current-location", children="Global", style={"fontSize": "28px", "fontWeight": "600", "marginBottom": "4px"}),
-                                html.P(id="current-time", children=datetime.now().strftime("%A, %B %d"), style={"color": "rgba(255,255,255,0.8)", "marginBottom": "20px"})
+                                html.P(id="current-time", children=datetime.now().strftime("%A, %B %d"), style={"color": "rgba(255,255,255,0.8)", "marginBottom": "20px"}),
+                                html.Div(id="data-status-alert", children=[])
                             ], width=12),
                         ]),
                         dbc.Row([
@@ -373,6 +377,7 @@ def update_main_content(map_clicks, analytics_clicks, fav_clicks, hist_clicks, s
                         dbc.Tab(label="💡 Insights", tab_id="insights"),
                         dbc.Tab(label="📈 Trends", tab_id="trends"),
                         dbc.Tab(label="⚖️ Compare", tab_id="compare"),
+                        dbc.Tab(label="🤖 Smart Analytics", tab_id="smart-analytics"),
                         dbc.Tab(label="📥 Export", tab_id="export")
                     ])
                 ]),
@@ -461,7 +466,7 @@ def update_main_content(map_clicks, analytics_clicks, fav_clicks, hist_clicks, s
                         dbc.Input(id="openai-key-input", type="password", placeholder="Enter OpenAI API key", value=db.get_api_key("openai") or "", className="mb-2"),
                         dbc.Button("Save", id="save-openai-key-btn", color="primary", size="sm", className="me-2"),
                         dbc.Badge("Configured" if db.get_api_key("openai") else "Not Set", color="success" if db.get_api_key("openai") else "secondary", className="ms-2"),
-                        html.Small("Used for AI-powered insights", className="text-muted d-block mt-1")
+                        html.Small("Used for AI-powered insights and Smart Analytics", className="text-muted d-block mt-1")
                     ], className="mb-4")
                 ])
             ], className="mb-4"),
@@ -539,10 +544,18 @@ def update_data(n, clicks, sidebar_clicks):
         else:
             try:
                 locations = api_client.get_locations(limit=500)
+                # get_locations returns a list, but if API call failed, it might be empty
+                # The error is already logged in _make_request
                 if locations:
                     cache_manager.set(cache_key, locations, timeout=300)
+                elif not cached:
+                    # If no cached data and API call returned empty, log warning
+                    logger.warning("No locations retrieved from OpenAQ API. Check your API key configuration.")
             except Exception as e:
                 logger.error(f"Error fetching locations: {e}")
+                # Check if it's an authentication error
+                if "401" in str(e) or "Unauthorized" in str(e):
+                    logger.error("OpenAQ API authentication failed. Please configure your API key in Settings.")
                 locations = cached if cached else []
     except Exception as e:
         logger.error(f"Error in update_data callback: {e}")
@@ -567,7 +580,21 @@ def update_data(n, clicks, sidebar_clicks):
 )
 def update_map(data, map_type):
     if not data:
-        return go.Figure()
+        # Show helpful message when no data
+        fig = go.Figure()
+        fig.add_annotation(
+            text="No data available. Please configure your OpenAQ API key in Settings.",
+            xref="paper", yref="paper",
+            x=0.5, y=0.5, showarrow=False,
+            font=dict(size=16, color="#666")
+        )
+        fig.update_layout(
+            plot_bgcolor="#1e1e1e",
+            paper_bgcolor="#2d2d30",
+            height=400,
+            margin=dict(l=0, r=0, t=0, b=0)
+        )
+        return fig
     
     try:
         df = pd.DataFrame(data)
@@ -624,24 +651,41 @@ def update_map(data, map_type):
 
 
 @callback(
-    [Output("main-aqi", "children"), Output("aqi-status-badge", "children")],
+    [Output("main-aqi", "children"), Output("aqi-status-badge", "children"), Output("data-status-alert", "children")],
     Input("locations-data", "data")
 )
 def update_aqi(data):
     if not data:
-        return "--", ""
+        alert = dbc.Alert([
+            html.I(className="fas fa-exclamation-triangle me-2"),
+            html.Strong("No Data Available"),
+            html.Br(),
+            html.Small([
+                "Please configure your OpenAQ API key in Settings. Get your key from ",
+                html.A("https://platform.openaq.org/", href="https://platform.openaq.org/", target="_blank", style={"color": "#007acc"})
+            ])
+        ], color="warning", className="mb-3")
+        return "--", "", alert
     try:
         df = pd.DataFrame(data)
         if df.empty or "max_aqi" not in df.columns:
-            return "--", ""
+            alert = dbc.Alert([
+                html.I(className="fas fa-info-circle me-2"),
+                "No air quality data available. Please check your API key configuration."
+            ], color="info", className="mb-3")
+            return "--", "", alert
         avg_aqi = int(df["max_aqi"].mean())
         category = data_processor.get_aqi_category(avg_aqi)
         color = data_processor.get_aqi_color(avg_aqi)
         badge = dbc.Badge(category, color="light", style={"backgroundColor": color, "padding": "8px 16px", "fontSize": "14px"})
-        return str(avg_aqi), badge
+        return str(avg_aqi), badge, []  # No alert when data is available
     except Exception as e:
         logger.error(f"Error updating AQI: {e}")
-        return "--", ""
+        alert = dbc.Alert([
+            html.I(className="fas fa-exclamation-circle me-2"),
+            f"Error loading data: {str(e)}"
+        ], color="danger", className="mb-3")
+        return "--", "", alert
 
 
 # ISSUE-002: Map click handler - opens action modal
@@ -766,7 +810,8 @@ def render_tab(tab, data):
                 return html.Div("Data format error", className="text-center py-5")
             
             top10 = df.nlargest(10, "max_aqi") if len(df) > 0 else df
-            fig = px.bar(top10, x="name", y="max_aqi", color="max_aqi", color_continuous_scale="RdYlGn_r", title="Top 10 Most Polluted Locations")
+            # Use Reds scale for pollution (higher = worse, darker red)
+            fig = px.bar(top10, x="name", y="max_aqi", color="max_aqi", color_continuous_scale="Reds", title="Top 10 Most Polluted Locations")
             
             insights = [
                 {"icon": "fas fa-exclamation-triangle", "title": "High Pollution Alert", "text": f"{len(df[df['max_aqi'] > 150])} locations with unhealthy air quality", "color": "#ff5252"},
@@ -790,15 +835,174 @@ def render_tab(tab, data):
             return html.Div([dcc.Graph(figure=fig)] + insight_cards)
         
         elif tab == "trends":
+            # Enhanced Trends Tab with visualizations
+            if "max_aqi" not in df.columns or "country" not in df.columns:
+                return html.Div("Data format error", className="text-center py-5")
+            
+            # Country-wise analysis
+            country_stats = df.groupby("country").agg({
+                "max_aqi": ["mean", "max", "min", "count"]
+            }).reset_index()
+            country_stats.columns = ["country", "avg_aqi", "max_aqi", "min_aqi", "count"]
+            country_stats = country_stats.sort_values("avg_aqi", ascending=False).head(15)
+            
+            # Create visualizations
+            fig1 = px.bar(
+                country_stats, 
+                x="country", 
+                y="avg_aqi", 
+                color="avg_aqi",
+                color_continuous_scale="Reds",
+                title="Average AQI by Country (Top 15)",
+                labels={"avg_aqi": "Average AQI", "country": "Country"}
+            )
+            fig1.update_layout(
+                plot_bgcolor="#1e1e1e",
+                paper_bgcolor="#2d2d30",
+                font_color="#cccccc",
+                xaxis_tickangle=-45
+            )
+            
+            # AQI distribution
+            aqi_ranges = {
+                "Good (0-50)": len(df[df["max_aqi"] <= 50]),
+                "Moderate (51-100)": len(df[(df["max_aqi"] > 50) & (df["max_aqi"] <= 100)]),
+                "Unhealthy (101-150)": len(df[(df["max_aqi"] > 100) & (df["max_aqi"] <= 150)]),
+                "Very Unhealthy (151-200)": len(df[(df["max_aqi"] > 150) & (df["max_aqi"] <= 200)]),
+                "Hazardous (201+)": len(df[df["max_aqi"] > 200])
+            }
+            
+            fig2 = px.pie(
+                values=list(aqi_ranges.values()),
+                names=list(aqi_ranges.keys()),
+                title="AQI Distribution",
+                color_discrete_sequence=px.colors.sequential.Reds
+            )
+            fig2.update_layout(
+                plot_bgcolor="#1e1e1e",
+                paper_bgcolor="#2d2d30",
+                font_color="#cccccc"
+            )
+            
+            # Top and bottom locations
+            top_polluted = df.nlargest(10, "max_aqi")[["name", "country", "max_aqi"]]
+            best_air = df.nsmallest(10, "max_aqi")[["name", "country", "max_aqi"]]
+            
             return html.Div([
-                html.H5("Air Quality Trends", className="mb-3"),
-                html.P("Historical data and ML predictions coming soon...")
+                dbc.Row([
+                    dbc.Col([
+                        dcc.Graph(figure=fig1, config={"displayModeBar": False})
+                    ], width=12, className="mb-3"),
+                ]),
+                dbc.Row([
+                    dbc.Col([
+                        dcc.Graph(figure=fig2, config={"displayModeBar": False})
+                    ], width=6),
+                    dbc.Col([
+                        dbc.Card([
+                            dbc.CardHeader("🔴 Top 10 Most Polluted"),
+                            dbc.CardBody([
+                                html.Table([
+                                    html.Thead([
+                                        html.Tr([
+                                            html.Th("Location", style={"color": "#cccccc"}),
+                                            html.Th("Country", style={"color": "#cccccc"}),
+                                            html.Th("AQI", style={"color": "#cccccc"})
+                                        ])
+                                    ]),
+                                    html.Tbody([
+                                        html.Tr([
+                                            html.Td(row["name"], style={"color": "#858585"}),
+                                            html.Td(row["country"], style={"color": "#858585"}),
+                                            html.Td(str(int(row["max_aqi"])), style={"color": "#ff5252", "fontWeight": "600"})
+                                        ])
+                                        for _, row in top_polluted.iterrows()
+                                    ])
+                                ], className="table table-sm", style={"color": "#cccccc"})
+                            ])
+                        ], style={"backgroundColor": "#2d2d30", "border": "1px solid #3e3e42"})
+                    ], width=6)
+                ]),
+                dbc.Row([
+                    dbc.Col([
+                        dbc.Card([
+                            dbc.CardHeader("✅ Top 10 Best Air Quality"),
+                            dbc.CardBody([
+                                html.Table([
+                                    html.Thead([
+                                        html.Tr([
+                                            html.Th("Location", style={"color": "#cccccc"}),
+                                            html.Th("Country", style={"color": "#cccccc"}),
+                                            html.Th("AQI", style={"color": "#cccccc"})
+                                        ])
+                                    ]),
+                                    html.Tbody([
+                                        html.Tr([
+                                            html.Td(row["name"], style={"color": "#858585"}),
+                                            html.Td(row["country"], style={"color": "#858585"}),
+                                            html.Td(str(int(row["max_aqi"])), style={"color": "#4caf50", "fontWeight": "600"})
+                                        ])
+                                        for _, row in best_air.iterrows()
+                                    ])
+                                ], className="table table-sm", style={"color": "#cccccc"})
+                            ])
+                        ], style={"backgroundColor": "#2d2d30", "border": "1px solid #3e3e42"})
+                    ], width=12, className="mt-3")
+                ])
             ])
         
         elif tab == "compare":
+            # Enhanced Compare Tab with city selection
+            if "max_aqi" not in df.columns or "name" not in df.columns:
+                return html.Div("Data format error", className="text-center py-5")
+            
+            # Get unique cities for dropdown
+            cities = df[["name", "country", "max_aqi"]].drop_duplicates().sort_values("name")
+            city_options = [{"label": f"{row['name']}, {row['country']} (AQI: {int(row['max_aqi'])})", 
+                           "value": f"{row['name']}|{row['country']}"} 
+                          for _, row in cities.iterrows()]
+            
             return html.Div([
-                html.H5("City Comparison", className="mb-3"),
-                html.P("Select multiple cities to compare their air quality metrics.")
+                html.H5("City Comparison", className="mb-3", style={"color": "#cccccc"}),
+                html.P("Select up to 5 cities to compare their air quality metrics.", 
+                      className="mb-3", style={"color": "#858585"}),
+                dcc.Dropdown(
+                    id="city-compare-dropdown",
+                    options=city_options,
+                    multi=True,
+                    placeholder="Select cities to compare...",
+                    maxHeight=200,
+                    style={"backgroundColor": "#2d2d30", "color": "#cccccc"}
+                ),
+                html.Div(id="city-comparison-results", className="mt-4")
+            ])
+        
+        elif tab == "smart-analytics":
+            # Smart Analytics Tab with OpenAI
+            openai_key = config.OPENAI_API_KEY or db.get_api_key("openai")
+            if not openai_key:
+                return html.Div([
+                    dbc.Alert([
+                        html.I(className="fas fa-exclamation-triangle me-2"),
+                        "OpenAI API key not configured. Please add OPENAI_API_KEY to your .env file or configure it in Settings to enable Smart Analytics."
+                    ], color="warning", className="mb-3"),
+                    html.P("Smart Analytics uses AI to provide deep insights, risk assessments, and recommendations based on your air quality and weather data.", 
+                          style={"color": "#858585"})
+                ])
+            
+            return html.Div([
+                html.H5("🤖 Smart Analytics", className="mb-3", style={"color": "#cccccc"}),
+                html.P("AI-powered analysis of your air quality and weather data", 
+                      className="mb-3", style={"color": "#858585"}),
+                dbc.Button([
+                    html.I(className="fas fa-brain me-2"),
+                    "Generate AI Insights"
+                ], id="generate-ai-insights-btn", color="primary", className="mb-3"),
+                dcc.Loading(
+                    id="ai-insights-loading",
+                    type="circle",
+                    children=html.Div(id="ai-insights-content")
+                )
             ])
         
         elif tab == "export":
@@ -1122,6 +1326,9 @@ def clear_history(n):
 def save_openaq_key(n, key_value):
     if n and key_value:
         db.save_api_key("openaq", key_value)
+        # Reinitialize API client with new key
+        global api_client
+        api_client = OpenAQClient(api_key=key_value, db=db)
         return "Saved!"
     return "Save"
 
@@ -1249,7 +1456,285 @@ def export_csv(n, data):
         except Exception as e:
             logger.error(f"Error exporting CSV: {e}")
             return "Error!"
-    return "Export to CSV"
+        return "Export to CSV"
+
+
+# City Comparison Callback
+@callback(
+    Output("city-comparison-results", "children"),
+    Input("city-compare-dropdown", "value"),
+    State("locations-data", "data"),
+    prevent_initial_call=True
+)
+def update_city_comparison(selected_cities, locations_data):
+    """Update city comparison results"""
+    if not selected_cities or not locations_data:
+        return html.Div()
+    
+    try:
+        # Parse selected cities
+        selected_list = selected_cities if isinstance(selected_cities, list) else [selected_cities]
+        
+        # Limit to 5 cities
+        if len(selected_list) > 5:
+            selected_list = selected_list[:5]
+        
+        # Extract city data
+        comparison_data = []
+        for city_str in selected_list:
+            name, country = city_str.split("|")
+            for loc in locations_data:
+                if isinstance(loc, dict) and loc.get("name") == name and loc.get("country") == country:
+                    comparison_data.append(loc)
+                    break
+        
+        if not comparison_data:
+            return html.Div("No matching cities found", className="text-center py-3")
+        
+        # Create comparison table
+        comparison_rows = []
+        for loc in comparison_data:
+            aqi = loc.get("max_aqi", 0)
+            aqi_color = data_processor.get_aqi_color(aqi) if isinstance(aqi, (int, float)) else "#666"
+            aqi_category = data_processor.get_aqi_category(aqi) if isinstance(aqi, (int, float)) else "Unknown"
+            
+            comparison_rows.append([
+                loc.get("name", "Unknown"),
+                loc.get("country", "Unknown"),
+                html.Span(str(int(aqi)), style={"color": aqi_color, "fontWeight": "600"}),
+                dbc.Badge(aqi_category, style={"backgroundColor": aqi_color, "color": "#fff", "fontSize": "11px"})
+            ])
+        
+        # Generate AI comparison if OpenAI is available
+        ai_comparison = None
+        openai_key = config.OPENAI_API_KEY or db.get_api_key("openai")
+        if openai_key and len(comparison_data) >= 2:
+            try:
+                ai_comparison = openai_client.generate_city_comparison(comparison_data)
+            except Exception as e:
+                logger.error(f"Error generating AI comparison: {e}")
+        
+        return html.Div([
+            dbc.Card([
+                dbc.CardHeader("📊 Comparison Table"),
+                dbc.CardBody([
+                    html.Table([
+                        html.Thead([
+                            html.Tr([
+                                html.Th("City", style={"color": "#cccccc"}),
+                                html.Th("Country", style={"color": "#cccccc"}),
+                                html.Th("AQI", style={"color": "#cccccc"}),
+                                html.Th("Category", style={"color": "#cccccc"})
+                            ])
+                        ]),
+                        html.Tbody([
+                            html.Tr([
+                                html.Td(row[0], style={"color": "#858585"}),
+                                html.Td(row[1], style={"color": "#858585"}),
+                                html.Td(row[2]),
+                                html.Td(row[3])
+                            ])
+                            for row in comparison_rows
+                        ])
+                    ], className="table table-striped", style={"color": "#cccccc"})
+                ])
+            ], style={"backgroundColor": "#2d2d30", "border": "1px solid #3e3e42"}, className="mb-3"),
+            
+            # AI Comparison if available
+            dbc.Card([
+                dbc.CardHeader("🤖 AI-Powered Analysis"),
+                dbc.CardBody([
+                    html.Div([
+                        html.H6("Summary", className="mb-2", style={"color": "#cccccc"}),
+                        html.P(ai_comparison.get("comparison_summary", "Analysis unavailable"), 
+                              style={"color": "#858585"}) if ai_comparison and not ai_comparison.get("error") else
+                        html.P("AI comparison requires OpenAI API key configuration", 
+                              style={"color": "#858585", "fontStyle": "italic"})
+                    ]),
+                    html.Div([
+                        html.H6("Key Insights", className="mb-2 mt-3", style={"color": "#cccccc"}),
+                        html.Ul([
+                            html.Li(insight, style={"color": "#858585", "marginBottom": "5px"})
+                            for insight in (ai_comparison.get("insights", []) if ai_comparison and not ai_comparison.get("error") else [])
+                        ])
+                    ]) if ai_comparison and not ai_comparison.get("error") and ai_comparison.get("insights") else html.Div()
+                ])
+            ], style={"backgroundColor": "#2d2d30", "border": "1px solid #3e3e42"}) if ai_comparison and not ai_comparison.get("error") else html.Div()
+        ])
+        
+    except Exception as e:
+        logger.error(f"Error updating city comparison: {e}")
+        return html.Div(f"Error: {str(e)}", className="text-danger text-center py-3")
+
+
+# Smart Analytics Callback
+@callback(
+    [Output("ai-insights-content", "children"), Output("generate-ai-insights-btn", "children")],
+    Input("generate-ai-insights-btn", "n_clicks"),
+    [State("locations-data", "data"), State("selected-location", "data")],
+    prevent_initial_call=True
+)
+def generate_ai_insights(n_clicks, locations_data, selected_location):
+    """Generate AI-powered insights"""
+    if not n_clicks or not locations_data:
+        return html.Div(), [
+            html.I(className="fas fa-brain me-2"),
+            "Generate AI Insights"
+        ]
+    
+    # Check for OpenAI key in config or database
+    openai_key = config.OPENAI_API_KEY or db.get_api_key("openai")
+    if not openai_key:
+        return html.Div([
+            dbc.Alert("OpenAI API key not configured. Please configure it in Settings.", color="warning")
+        ]), [
+            html.I(className="fas fa-exclamation-triangle me-2"),
+            "API Key Required"
+        ]
+    
+    # Use database key if available, otherwise config key - reinitialize if needed
+    global openai_client
+    if not openai_client._is_configured() and openai_key:
+        openai_client = OpenAIClient(api_key=openai_key)
+    
+    try:
+        # Get weather data for selected location if available
+        weather_data = None
+        if selected_location and isinstance(selected_location, dict):
+            coords = selected_location.get("coordinates", {})
+            lat = coords.get("latitude") if isinstance(coords, dict) else None
+            lon = coords.get("longitude") if isinstance(coords, dict) else None
+            if lat and lon and config.WEATHER_API_KEY:
+                try:
+                    weather_data = weather_client.get_current_weather(lat, lon)
+                except Exception as e:
+                    logger.error(f"Error fetching weather for AI insights: {e}")
+        
+        # Generate AI insights
+        ai_result = openai_client.generate_analytics_insights(locations_data, weather_data)
+        
+        if ai_result.get("error"):
+            return html.Div([
+                dbc.Alert([
+                    html.I(className="fas fa-exclamation-triangle me-2"),
+                    ai_result.get("error", "Error generating insights")
+                ], color="danger")
+            ]), [
+                html.I(className="fas fa-exclamation-triangle me-2"),
+                "Error - Try Again"
+            ]
+        
+        insights = ai_result.get("insights", {})
+        if isinstance(insights, str):
+            insights = {"summary": insights}
+        
+        # Build results display
+        result_cards = []
+        
+        # Summary
+        if insights.get("summary"):
+            result_cards.append(
+                dbc.Card([
+                    dbc.CardHeader("📋 Executive Summary"),
+                    dbc.CardBody([
+                        html.P(insights.get("summary"), style={"color": "#cccccc", "lineHeight": "1.6"})
+                    ])
+                ], style={"backgroundColor": "#2d2d30", "border": "1px solid #3e3e42"}, className="mb-3")
+            )
+        
+        # Key Findings
+        if insights.get("key_findings"):
+            findings_list = insights.get("key_findings", [])
+            if isinstance(findings_list, list):
+                result_cards.append(
+                    dbc.Card([
+                        dbc.CardHeader("🔍 Key Findings"),
+                        dbc.CardBody([
+                            html.Ul([
+                                html.Li(finding, style={"color": "#858585", "marginBottom": "8px"})
+                                for finding in findings_list
+                            ])
+                        ])
+                    ], style={"backgroundColor": "#2d2d30", "border": "1px solid #3e3e42"}, className="mb-3")
+                )
+        
+        # Risk Assessment
+        if insights.get("risk_assessment"):
+            result_cards.append(
+                dbc.Card([
+                    dbc.CardHeader("⚠️ Risk Assessment"),
+                    dbc.CardBody([
+                        html.P(insights.get("risk_assessment"), style={"color": "#cccccc", "lineHeight": "1.6"})
+                    ])
+                ], style={"backgroundColor": "#2d2d30", "border": "1px solid #3e3e42"}, className="mb-3")
+            )
+        
+        # Geographic Insights
+        if insights.get("geographic_insights"):
+            result_cards.append(
+                dbc.Card([
+                    dbc.CardHeader("🌍 Geographic Insights"),
+                    dbc.CardBody([
+                        html.P(insights.get("geographic_insights"), style={"color": "#cccccc", "lineHeight": "1.6"})
+                    ])
+                ], style={"backgroundColor": "#2d2d30", "border": "1px solid #3e3e42"}, className="mb-3")
+            )
+        
+        # Recommendations
+        if insights.get("recommendations"):
+            rec_list = insights.get("recommendations", [])
+            if isinstance(rec_list, list):
+                result_cards.append(
+                    dbc.Card([
+                        dbc.CardHeader("💡 Recommendations"),
+                        dbc.CardBody([
+                            html.Ul([
+                                html.Li(rec, style={"color": "#858585", "marginBottom": "8px"})
+                                for rec in rec_list
+                            ])
+                        ])
+                    ], style={"backgroundColor": "#2d2d30", "border": "1px solid #3e3e42"}, className="mb-3")
+                )
+        
+        # Weather Correlation
+        if insights.get("weather_correlation"):
+            result_cards.append(
+                dbc.Card([
+                    dbc.CardHeader("🌤️ Weather Correlation"),
+                    dbc.CardBody([
+                        html.P(insights.get("weather_correlation"), style={"color": "#cccccc", "lineHeight": "1.6"})
+                    ])
+                ], style={"backgroundColor": "#2d2d30", "border": "1px solid #3e3e42"}, className="mb-3")
+            )
+        
+        # If no structured data, show raw response
+        if not result_cards and ai_result.get("raw_response"):
+            result_cards.append(
+                dbc.Card([
+                    dbc.CardHeader("🤖 AI Analysis"),
+                    dbc.CardBody([
+                        html.Pre(ai_result.get("raw_response"), 
+                                style={"color": "#cccccc", "whiteSpace": "pre-wrap", "fontFamily": "inherit"})
+                    ])
+                ], style={"backgroundColor": "#2d2d30", "border": "1px solid #3e3e42"})
+            )
+        
+        return html.Div(result_cards), [
+            html.I(className="fas fa-check me-2"),
+            "Insights Generated!"
+        ]
+        
+    except Exception as e:
+        logger.error(f"Error generating AI insights: {e}")
+        return html.Div([
+            dbc.Alert([
+                html.I(className="fas fa-exclamation-triangle me-2"),
+                f"Error: {str(e)}"
+            ], color="danger")
+        ]), [
+            html.I(className="fas fa-exclamation-triangle me-2"),
+            "Error - Try Again"
+        ]
 
 
 # Remove favorite callback - updates the favorites view when a favorite is removed

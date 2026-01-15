@@ -12,21 +12,44 @@ import config
 class OpenAQClient:
     """Client for interacting with OpenAQ API v3"""
     
-    def __init__(self, api_key: Optional[str] = None):
+    def __init__(self, api_key: Optional[str] = None, db: Optional[Any] = None):
         """
         Initialize OpenAQ API client
         
         Args:
-            api_key: OpenAQ API key (optional, uses config if not provided)
+            api_key: OpenAQ API key (optional, uses config or database if not provided)
+            db: Database instance to check for stored API keys
         """
-        self.api_key = api_key or config.OPENAQ_API_KEY
+        # Try to get API key from: provided > config > database
+        self.api_key = api_key
+        if not self.api_key:
+            self.api_key = config.OPENAQ_API_KEY
+        if not self.api_key and db:
+            try:
+                self.api_key = db.get_api_key("openaq")
+            except Exception as e:
+                logger.debug(f"Could not get API key from database: {e}")
+        
+        # Clean up API key - remove whitespace and quotes
+        if self.api_key:
+            self.api_key = self.api_key.strip().strip('"').strip("'")
+        
+        # Warn if API key looks like OpenAI key (starts with sk-)
+        if self.api_key and self.api_key.startswith("sk-"):
+            logger.warning("API key format looks like OpenAI key (starts with 'sk-'). OpenAQ API keys have a different format.")
+            logger.warning("Please verify you're using the correct API key from https://platform.openaq.org/")
+        
         self.base_url = config.OPENAQ_BASE_URL
         self.headers = {}
         
         if self.api_key:
+            # OpenAQ API v3 uses X-API-Key header
             self.headers["X-API-Key"] = self.api_key
-        
-        logger.info("OpenAQ API client initialized")
+            # Log first and last 4 chars for debugging (without exposing full key)
+            key_preview = f"{self.api_key[:4]}...{self.api_key[-4:]}" if len(self.api_key) > 8 else "***"
+            logger.info(f"OpenAQ API client initialized with API key: {key_preview}")
+        else:
+            logger.warning("OpenAQ API client initialized without API key - some endpoints may require authentication")
     
     def _make_request(self, endpoint: str, params: Optional[Dict] = None) -> Dict[str, Any]:
         """
@@ -43,6 +66,10 @@ class OpenAQClient:
         
         try:
             logger.debug(f"Making request to {url} with params: {params}")
+            # Log headers (without exposing full API key)
+            debug_headers = {k: (v[:4] + "..." + v[-4:] if len(v) > 8 else "***") if "key" in k.lower() else v 
+                           for k, v in self.headers.items()}
+            logger.debug(f"Request headers: {debug_headers}")
             response = requests.get(url, headers=self.headers, params=params, timeout=30)
             response.raise_for_status()
             
@@ -50,6 +77,23 @@ class OpenAQClient:
             logger.debug(f"Received {len(data.get('results', []))} results")
             return data
             
+        except requests.exceptions.HTTPError as e:
+            status_code = e.response.status_code if hasattr(e, 'response') else None
+            if status_code == 401:
+                logger.error(f"OpenAQ API authentication failed (401). Please check your API key in Settings or .env file.")
+                logger.error(f"Get your API key from: https://platform.openaq.org/")
+                # Try to get response body for more details
+                try:
+                    if hasattr(e, 'response') and e.response.text:
+                        error_detail = e.response.json() if e.response.headers.get('content-type', '').startswith('application/json') else e.response.text[:200]
+                        logger.error(f"API error details: {error_detail}")
+                except:
+                    pass
+            elif status_code == 403:
+                logger.error(f"OpenAQ API access forbidden (403). Your API key may not have permission for this endpoint.")
+            else:
+                logger.error(f"API request failed with status {status_code}: {e}")
+            return {"results": [], "meta": {}, "error": str(e), "status_code": status_code}
         except requests.exceptions.RequestException as e:
             logger.error(f"API request failed: {e}")
             return {"results": [], "meta": {}, "error": str(e)}
